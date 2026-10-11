@@ -1,0 +1,2 @@
+Signal Double Ratchet Spec: https://signal.org/docs/specifications/doubleratchet/
+Cryptography Library Docs:  https://cryptography.io/en/latest
