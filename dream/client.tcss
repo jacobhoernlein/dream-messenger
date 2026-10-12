@@ -1,0 +1,15 @@
+Screen {
+	layout: vertical;
+}
+
+RichLog {
+	height: 1fr;
+	overflow-x: hidden;
+	padding: 1 2;
+}
+
+#message-box {
+	height: 3;
+	min-height: 3;
+	max-height: 8;
+}

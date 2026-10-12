@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
@@ -7,62 +8,23 @@ from cryptography.hazmat.primitives.hmac import HMAC
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 
-def kdf_rk(root_key: bytes, dh_key: bytes) -> tuple[bytes, bytes]:
-    """Derive a new root key and chain key from the given root key 
-    and DH key.
-    
-    Args:
-        root_key (bytes): The current root key
-        dh_key (bytes): The key output from the DH step
-    
-    Returns:
-        tuple[bytes, bytes]: The new root key and chain key
-    """
-
-    kdf_out = HKDF(
-        algorithm=hashes.SHA256(),
-        length=64,
-        salt=root_key,
-        info=b"kdf_rk"
-    ).derive(dh_key)
-
-    return kdf_out[:32], kdf_out[32:]
-
-def kdf_ck(chain_key: bytes) -> bytes:
-    """Derive a new chain key and message key from a given chain key.
-    
-    Args:
-        chain_key (bytes): The current chain key
-
-    Returns:
-        tuple[bytes, bytes]: The new chain key and message key 
-    """
-    
-    hmac = HMAC(
-        key=chain_key,
-        algorithm=hashes.SHA256()
-    )
-    hmac.update(b'chain_key')
-    ck = hmac.copy().finalize()
-    hmac.update(b'message_key')
-
-    return ck, hmac.finalize()
-
-@dataclass
-class Header:
-
-    DH: X25519PublicKey # The current DH public key of sender
-    PN: int             # Previous chain length
-    N:  int             # Message number
-
-    def encode(self) -> bytes:
-        return self.DH.public_bytes_raw() + self.PN.to_bytes(4) + self.N.to_bytes(4)
-
 @dataclass
 class Message:
 
+    @dataclass
+    class Header:
+
+        DH: X25519PublicKey # The current DH public key of sender
+        PN: int             # Previous chain length
+        N:  int             # Message number
+        timestamp: datetime
+
+        def encode(self) -> bytes:
+            return self.DH.public_bytes_raw() + self.PN.to_bytes(4) + self.N.to_bytes(4) + self.timestamp.isoformat().encode()
+
     header: Header
     ciphertext: bytes
+
 
 class DoubleRatchet:
 
@@ -77,7 +39,7 @@ class DoubleRatchet:
         Ns: int=0,
         Nr: int=0,
         PN: int=0,
-        MKSKIPPED: dict[tuple[X25519PublicKey, int], bytes]={},
+        MKSKIPPED: dict[tuple[X25519PublicKey, int], bytes]=None,
     ):
         """Creates a new DoubleRatchet state object.
         
@@ -103,7 +65,52 @@ class DoubleRatchet:
         self.Ns = Ns
         self.Nr = Nr
         self.PN = PN
-        self.MKSKIPPED = MKSKIPPED
+        self.MKSKIPPED = {} if MKSKIPPED is None else MKSKIPPED
+
+    @staticmethod
+    def __kdf_rk(root_key: bytes, dh_key: bytes) -> tuple[bytes, bytes]:
+        """Derive a new root key and chain key from the given root key 
+        and DH key.
+        
+        Args:
+            root_key (bytes): The current root key
+            dh_key (bytes): The key output from the DH step
+        
+        Returns:
+            tuple[bytes, bytes]: The new root key and chain key
+        """
+
+        # Uses HKDF as recommended by Signal spec
+        kdf_out = HKDF(
+            algorithm=hashes.SHA256(),
+            length=64,
+            salt=root_key,
+            info=b"kdf_rk"
+        ).derive(dh_key)
+
+        return kdf_out[:32], kdf_out[32:]
+
+    @staticmethod
+    def __kdf_ck(chain_key: bytes) -> tuple[bytes, bytes]:
+        """Derive a new chain key and message key from a given chain key.
+        
+        Args:
+            chain_key (bytes): The current chain key
+
+        Returns:
+            tuple[bytes, bytes]: The new chain key and message key 
+        """
+        
+        # Uses HMAC as recommended by Signal spec
+        hmac = HMAC(
+            key=chain_key,
+            algorithm=hashes.SHA256()
+        )
+        hmac.update(b'chain_key')
+        ck = hmac.copy().finalize()
+        hmac.update(b'message_key')
+
+        return ck, hmac.finalize()
 
     def __skip_keys(self, until: int) -> None:
         """Skips keys until given N is reached in receiving chain, 
@@ -120,12 +127,12 @@ class DoubleRatchet:
             raise ValueError("Max skips exceeded.")
         if self.CKr is not None:
             while self.Nr < until:
-                self.CKr, message_key = kdf_ck(self.CKr)
+                self.CKr, message_key = self.__kdf_ck(self.CKr)
                 self.MKSKIPPED[(self.DHr.public_bytes_raw(), self.Nr)] = message_key
                 self.Nr += 1
 
     def __dh_ratchet(self, DHr: X25519PublicKey) -> None:
-        """Performs a Diffie-Hellman ratchet
+        """Performs a Diffie-Hellman ratchet based on new DHr
         
         Args:
             DHr: The new public key
@@ -135,9 +142,9 @@ class DoubleRatchet:
         """
 
         # Ratchet recieve and send chain keys based on received public key
-        self.RK, self.CKr = kdf_rk(self.RK, self.DHs.exchange(DHr))
+        self.RK, self.CKr = self.__kdf_rk(self.RK, self.DHs.exchange(DHr))
         self.DHs = X25519PrivateKey.generate()
-        self.RK, self.CKs = kdf_rk(self.RK, self.DHs.exchange(DHr))
+        self.RK, self.CKs = self.__kdf_rk(self.RK, self.DHs.exchange(DHr))
 
         # Reset other state data
         self.PN = self.Ns
@@ -168,7 +175,7 @@ class DoubleRatchet:
 
         # Generate first send chain key and store root key
         DHs = X25519PrivateKey.generate()
-        RK, CKs = kdf_rk(SK, DHs.exchange(IDr))
+        RK, CKs = cls.__kdf_rk(SK, DHs.exchange(IDr))
 
         return cls(DHs, IDr, RK, CKs, None, AD)        
 
@@ -196,9 +203,9 @@ class DoubleRatchet:
         AD = IDi.public_bytes_raw() + IDr.public_key().public_bytes_raw()
 
         # Generate receive and send chain keys based on received public key
-        RK, CKr = kdf_rk(SK, IDr.exchange(DHr))
+        RK, CKr = cls.__kdf_rk(SK, IDr.exchange(DHr))
         DHs = X25519PrivateKey.generate()
-        RK, CKs = kdf_rk(RK, DHs.exchange(DHr))
+        RK, CKs = cls.__kdf_rk(RK, DHs.exchange(DHr))
 
         return cls(DHs, DHr, RK, CKs, CKr, AD)
 
@@ -213,10 +220,15 @@ class DoubleRatchet:
         """
 
         # Ratchet send key chain
-        self.CKs, message_key = kdf_ck(self.CKs)
+        self.CKs, message_key = self.__kdf_ck(self.CKs)
 
         # Create header for message and authenticated ciphertext
-        header = Header(self.DHs.public_key(), self.PN, self.Ns)
+        header = Message.Header(
+            self.DHs.public_key(), 
+            self.PN, 
+            self.Ns, 
+            datetime.now(timezone.utc)
+        )
         ciphertext = AESGCMSIV(message_key).encrypt(
             bytearray(12),  # Keys are unique for each message, so nonce can be null.
             raw_message,
@@ -247,7 +259,7 @@ class DoubleRatchet:
         Ns = self.Ns
         Nr = self.Nr
         PN = self.PN
-        MKSKIPPED = self.MKSKIPPED
+        MKSKIPPED = dict(self.MKSKIPPED)
 
         header = message.header
         ciphertext = message.ciphertext
@@ -261,7 +273,7 @@ class DoubleRatchet:
 
             else:
                 # If received header doesn't match, store keys and ratchet
-                if message.header.DH != self.DHr:
+                if message.header.DH.public_bytes_raw() != self.DHr.public_bytes_raw():
                     self.__skip_keys(message.header.PN)
                     self.__dh_ratchet(message.header.DH)
 
@@ -269,7 +281,7 @@ class DoubleRatchet:
                 self.__skip_keys(message.header.N)
 
                 # Get message key and new receiving chain key
-                self.CKr, mk = kdf_ck(self.CKr)
+                self.CKr, mk = self.__kdf_ck(self.CKr)
                 self.Nr += 1
 
             return AESGCMSIV(mk).decrypt(
@@ -311,13 +323,3 @@ if __name__ == "__main__":
     b2 = bob_state.encrypt(b'How are you?')
 
     alice_state.decrypt(b1)
-
-    alice_state.decrypt(b2)
-
-    try:
-        alice_state.decrypt(b1)
-    except:
-        pass
-
-    b3 = bob_state.encrypt(b'sdaojlk')
-    alice_state.decrypt(b3)
