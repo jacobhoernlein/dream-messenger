@@ -697,3 +697,6 @@ if __name__ == "__main__":
             recipient_name=args.recipient
         )
         client.run()
+    else:
+        print(f"Invalid command: {args.command}")
+        exit(1)
